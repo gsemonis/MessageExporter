@@ -261,13 +261,9 @@ class MessageExporter(private val contentResolver: ContentResolver) {
                 
                 if (ct == "text/plain" || ct == "application/smil") {
                     bodyBuilder.append(if (textCol != -1) cursor.getString(textCol) ?: "" else "")
-                } else if (ct.startsWith("image/") || ct.startsWith("video/") || ct.startsWith("audio/")) {
-                    val extension = when {
-                        ct.startsWith("image/") -> ct.substringAfter("image/")
-                        ct.startsWith("video/") -> ct.substringAfter("video/")
-                        ct.startsWith("audio/") -> ct.substringAfter("audio/")
-                        else -> "bin"
-                    }
+                } else {
+                    // Export all non-text attachments (images, video, audio, vcards, PDFs, etc.)
+                    val extension = getExtensionFromMimeType(ct)
                     val fileName = "mms_${mmsId}_part_${partId}.$extension"
                     val destFile = File(attachmentsDir, fileName)
                     
@@ -278,6 +274,21 @@ class MessageExporter(private val contentResolver: ContentResolver) {
             }
         }
         message.body = bodyBuilder.toString().trim()
+    }
+
+    private fun getExtensionFromMimeType(mimeType: String): String {
+        val extension = android.webkit.MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType)
+        if (extension != null) return extension
+
+        return when {
+            mimeType.startsWith("image/") -> mimeType.substringAfter("image/").substringBefore(";").replace("jpeg", "jpg")
+            mimeType.startsWith("video/") -> mimeType.substringAfter("video/").substringBefore(";")
+            mimeType.startsWith("audio/") -> mimeType.substringAfter("audio/").substringBefore(";")
+            mimeType.contains("vcard") -> "vcf"
+            mimeType.contains("pdf") -> "pdf"
+            mimeType.contains("xml") -> "xml"
+            else -> "bin"
+        }
     }
 
     private fun savePartToFile(partId: Long, destFile: File): Boolean {
