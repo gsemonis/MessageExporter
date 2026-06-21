@@ -1,6 +1,7 @@
 package com.sway.messageexporter
 
 import android.content.ContentResolver
+import android.content.Context
 import android.net.Uri
 import android.provider.Telephony
 import android.util.Log
@@ -11,8 +12,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-class MessageExporter(private val contentResolver: ContentResolver) {
+class MessageExporter(private val context: Context) {
 
+    private val contentResolver: ContentResolver = context.contentResolver
     private val contactCache = mutableMapOf<String, String>()
 
     fun exportThread(threadId: Long, outputFile: File, onProgress: ((Int, Int) -> Unit)? = null): Boolean {
@@ -20,85 +22,36 @@ class MessageExporter(private val contentResolver: ContentResolver) {
         val attachmentsDir = File(outputFile.parentFile, "attachments_${outputFile.nameWithoutExtension}")
         if (!attachmentsDir.exists()) attachmentsDir.mkdirs()
 
-        // 1. Get addresses for this thread
+        // 1. Get initial total count for progress
+        val smsCount = getTableCount(Telephony.Sms.CONTENT_URI, threadId)
+        val mmsCount = getTableCount(Telephony.Mms.CONTENT_URI, threadId)
+        val initialTotal = smsCount + mmsCount
+        onProgress?.invoke(0, initialTotal)
+        Log.d("MessageExporter", "Pre-fetch count: SMS=$smsCount, MMS=$mmsCount, Total=$initialTotal")
+
+        // 2. Get addresses for this thread
         val addresses = getThreadAddresses(threadId)
-        Log.d("MessageExporter", "Thread $threadId has addresses: $addresses")
 
-        // 2. Try unified query
-        val unifiedUri = "content://mms-sms/conversations/$threadId".toUri()
-        try {
-            contentResolver.query(unifiedUri, null, null, null, "date ASC")?.use { c ->
-                val total = c.count
-                Log.d("MessageExporter", "Unified query found $total entries")
-                
-                val idCol = c.getColumnIndex("_id")
-                val transportCol = c.getColumnIndex("transport_type")
-                val bodyCol = c.getColumnIndex("body")
-                val addressCol = c.getColumnIndex("address")
-                val dateCol = c.getColumnIndex("date")
-                val typeCol = c.getColumnIndex("type")
-                val msgIdIdx = c.getColumnIndex("message_id")
-                val replyIdx = c.getColumnIndex("replied_to_message_id")
-
-                var current = 0
-                while (c.moveToNext()) {
-                    current++
-                    onProgress?.invoke(current, total)
-
-                    val id = c.getLong(idCol)
-                    val transport = if (transportCol != -1) c.getString(transportCol) else "sms"
-                    
-                    if (bodyCol != -1 && addressCol != -1 && dateCol != -1) {
-                        val body = c.getString(bodyCol) ?: ""
-                        val address = c.getString(addressCol) ?: "Unknown"
-                        val date = c.getLong(dateCol)
-                        val type = if (typeCol != -1) c.getInt(typeCol) else 1
-                        
-                        val msg = Message(
-                            id = id,
-                            type = if (type == 1) "INCOMING" else "OUTGOING",
-                            address = address,
-                            senderName = getContactName(address),
-                            body = body,
-                            date = if (transport == "mms") date * 1000 else date,
-                            protocol = transport.uppercase(),
-                            reactions = getReactions(id),
-                            rcsMessageId = if (msgIdIdx != -1) c.getString(msgIdIdx) else null,
-                            replyToId = if (replyIdx != -1) c.getString(replyIdx) else null
-                        )
-                        
-                        if (transport == "mms") {
-                            extractMmsParts(id, msg, attachmentsDir)
-                        }
-                        messages.add(msg)
-                    } else {
-                        if (transport == "sms") fetchSmsMessage(id, messages) else fetchMmsMessage(id, messages, attachmentsDir)
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("MessageExporter", "Unified query failed", e)
+        // 3. Bulk Fetch SMS with progress
+        fetchSmsBulk(threadId, addresses, messages) { current ->
+            onProgress?.invoke(current, initialTotal)
+        }
+        
+        // 4. Bulk Fetch MMS with progress
+        val smsFetchedCount = messages.size
+        fetchMmsBulk(threadId, messages, attachmentsDir) { current ->
+            onProgress?.invoke(smsFetchedCount + current, initialTotal)
         }
 
-        // 3. Fallback: Query by thread_id directly in tables
-        if (messages.size < 50) {
-            Log.d("MessageExporter", "Falling back to direct thread_id queries")
-            fetchSmsFromTable(threadId, messages)
-            fetchMmsFromTable(threadId, messages, attachmentsDir)
-        }
-
-        // 4. Ultimate Fallback: Query by address
-        if (messages.size < 50 && addresses.isNotEmpty()) {
-            Log.d("MessageExporter", "Falling back to address-based queries")
-            addresses.forEach { address ->
-                fetchSmsByAddress(address, messages)
-            }
-        }
+        // 5. Finalize Count & Reporting
+        val fetchedTotal = messages.size
+        Log.d("MessageExporter", "Final message count found: $fetchedTotal")
 
         messages.sortBy { it.date }
         val distinctMessages = messages.distinctBy { "${it.protocol}_${it.id}" }
-        Log.d("MessageExporter", "Final deduplicated count: ${distinctMessages.size}")
-
+        val finalTotal = distinctMessages.size
+        
+        // 6. Final Write with progress
         return try {
             outputFile.bufferedWriter().use { out ->
                 val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
@@ -112,7 +65,12 @@ class MessageExporter(private val contentResolver: ContentResolver) {
                 }
                 out.write("  </participants>\n")
                 
+                var writeCount = 0
                 distinctMessages.forEach { msg ->
+                    writeCount++
+                    // Ensure display progress is accurate compared to final total
+                    onProgress?.invoke(writeCount, finalTotal)
+
                     val typeAttr = msg.type.lowercase()
                     val protocolAttr = msg.protocol.replace("/", "_").lowercase()
                     val dateStr = dateFormat.format(Date(msg.date))
@@ -145,6 +103,9 @@ class MessageExporter(private val contentResolver: ContentResolver) {
                 }
                 out.write("</thread>\n")
             }
+            
+            val xsdFile = File(outputFile.parentFile, "messages.xsd")
+            copyXsdFromAssets(xsdFile)
             true
         } catch (e: Exception) {
             Log.e("MessageExporter", "Failed to write XML", e)
@@ -152,81 +113,74 @@ class MessageExporter(private val contentResolver: ContentResolver) {
         }
     }
 
-    private fun getThreadAddresses(threadId: Long): List<String> {
-        val result = mutableListOf<String>()
-        val uri = "content://mms-sms/conversations?simple=true".toUri()
-        contentResolver.query(uri, arrayOf("recipient_ids"), "_id = ?", arrayOf(threadId.toString()), null)?.use { c ->
-            if (c.moveToFirst()) {
-                val ids = c.getString(0)?.split(" ") ?: emptyList()
-                val addressUri = "content://mms-sms/canonical-addresses".toUri()
-                ids.forEach { id ->
-                    if (id.isBlank()) return@forEach
-                    try {
-                        contentResolver.query(addressUri, arrayOf("address"), "_id = ?", arrayOf(id), null)?.use { ac ->
-                            if (ac.moveToFirst()) {
-                                ac.getString(0)?.let { result.add(it) }
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.w("MessageExporter", "Failed to query canonical address for id $id", e)
-                    }
+    private fun getTableCount(uri: Uri, threadId: Long): Int {
+        return try {
+            contentResolver.query(uri, arrayOf("COUNT(*)"), "thread_id = ?", arrayOf(threadId.toString()), null)?.use { c ->
+                if (c.moveToFirst()) c.getInt(0) else 0
+            } ?: 0
+        } catch (_: Exception) { 0 }
+    }
+
+    private fun fetchSmsBulk(threadId: Long, addresses: List<String>, messages: MutableList<Message>, onProgress: (Int) -> Unit) {
+        val uri = Telephony.Sms.CONTENT_URI
+        val projection = arrayOf(Telephony.Sms._ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.TYPE)
+        
+        contentResolver.query(uri, projection, "${Telephony.Sms.THREAD_ID} = ?", arrayOf(threadId.toString()), "date ASC")?.use { c ->
+            addSmsFromCursor(c, messages, onProgress)
+        }
+
+        if (messages.size < 10 && addresses.isNotEmpty()) {
+            addresses.forEach { address ->
+                contentResolver.query(uri, projection, "address LIKE ?", arrayOf("%$address%"), "date ASC")?.use { c ->
+                    addSmsFromCursor(c, messages, onProgress)
                 }
             }
         }
-        return result
     }
 
-    private fun fetchSmsByAddress(address: String, messages: MutableList<Message>) {
-        val uri = Telephony.Sms.CONTENT_URI
-        try {
-            contentResolver.query(uri, arrayOf(Telephony.Sms._ID), "address LIKE ?", arrayOf("%$address%"), "date ASC")?.use { c ->
-                val idCol = c.getColumnIndex(Telephony.Sms._ID)
-                while (c.moveToNext()) fetchSmsMessage(c.getLong(idCol), messages)
-            }
-        } catch (e: Exception) {
-            Log.e("MessageExporter", "Address query failed", e)
+    private fun addSmsFromCursor(c: android.database.Cursor, messages: MutableList<Message>, onProgress: (Int) -> Unit) {
+        val idCol = c.getColumnIndex(Telephony.Sms._ID)
+        val addrCol = c.getColumnIndex(Telephony.Sms.ADDRESS)
+        val bodyCol = c.getColumnIndex(Telephony.Sms.BODY)
+        val dateCol = c.getColumnIndex(Telephony.Sms.DATE)
+        val typeCol = c.getColumnIndex(Telephony.Sms.TYPE)
+
+        while (c.moveToNext()) {
+            onProgress(messages.size + 1)
+            
+            val id = c.getLong(idCol)
+            val address = c.getString(addrCol) ?: "Unknown"
+            val type = c.getInt(typeCol)
+            messages.add(Message(
+                id = id,
+                type = if (type == Telephony.Sms.MESSAGE_TYPE_INBOX) "INCOMING" else "OUTGOING",
+                address = address,
+                senderName = getContactName(address),
+                body = c.getString(bodyCol) ?: "",
+                date = c.getLong(dateCol),
+                protocol = "SMS",
+                reactions = getReactions(id)
+            ))
         }
     }
 
-    private fun fetchSmsMessage(id: Long, messages: MutableList<Message>) {
-        val uri = "content://sms/$id".toUri()
-        val projection = arrayOf(
-            Telephony.Sms.ADDRESS,
-            Telephony.Sms.BODY,
-            Telephony.Sms.DATE,
-            Telephony.Sms.TYPE
-        )
-        contentResolver.query(uri, projection, null, null, null)?.use { c ->
-            if (c.moveToFirst()) {
-                val address = c.getString(0) ?: "Unknown"
-                val body = c.getString(1) ?: ""
-                val date = c.getLong(2)
-                val type = c.getInt(3)
+    private fun fetchMmsBulk(threadId: Long, messages: MutableList<Message>, attachmentsDir: File, onProgress: (Int) -> Unit) {
+        val uri = Telephony.Mms.CONTENT_URI
+        val projection = arrayOf(Telephony.Mms._ID, Telephony.Mms.DATE, Telephony.Mms.MESSAGE_BOX)
+        
+        contentResolver.query(uri, projection, "${Telephony.Mms.THREAD_ID} = ?", arrayOf(threadId.toString()), "date ASC")?.use { c ->
+            val idCol = c.getColumnIndex(Telephony.Mms._ID)
+            val dateCol = c.getColumnIndex(Telephony.Mms.DATE)
+            val boxCol = c.getColumnIndex(Telephony.Mms.MESSAGE_BOX)
 
-                messages.add(Message(
-                    id = id,
-                    type = if (type == Telephony.Sms.MESSAGE_TYPE_INBOX) "INCOMING" else "OUTGOING",
-                    address = address,
-                    senderName = getContactName(address),
-                    body = body,
-                    date = date,
-                    protocol = "SMS",
-                    reactions = getReactions(id)
-                ))
-            }
-        }
-    }
-
-    private fun fetchMmsMessage(id: Long, messages: MutableList<Message>, attachmentsDir: File) {
-        val uri = "content://mms/$id".toUri()
-        val projection = arrayOf(
-            Telephony.Mms.DATE,
-            Telephony.Mms.MESSAGE_BOX
-        )
-        contentResolver.query(uri, projection, null, null, null)?.use { c ->
-            if (c.moveToFirst()) {
-                val date = c.getLong(0) * 1000
-                val box = c.getInt(1)
+            var count = 0
+            while (c.moveToNext()) {
+                count++
+                onProgress(count)
+                
+                val id = c.getLong(idCol)
+                val date = c.getLong(dateCol) * 1000
+                val box = c.getInt(boxCol)
                 val address = getMmsAddress(id)
 
                 val msg = Message(
@@ -246,11 +200,10 @@ class MessageExporter(private val contentResolver: ContentResolver) {
     }
 
     private fun extractMmsParts(mmsId: Long, message: Message, attachmentsDir: File) {
-        val selection = "mid=$mmsId"
         val uri = "content://mms/part".toUri()
         val bodyBuilder = StringBuilder()
         
-        contentResolver.query(uri, null, selection, null, null)?.use { cursor ->
+        contentResolver.query(uri, null, "mid=$mmsId", null, null)?.use { cursor ->
             val idCol = cursor.getColumnIndex("_id")
             val textCol = cursor.getColumnIndex("text")
             val ctCol = cursor.getColumnIndex("ct")
@@ -266,9 +219,8 @@ class MessageExporter(private val contentResolver: ContentResolver) {
                     val extension = getExtensionFromMimeType(ct)
                     val fileName = "mms_${mmsId}_part_${partId}.$extension"
                     val destFile = File(attachmentsDir, fileName)
-                    
                     if (savePartToFile(partId, destFile)) {
-                        message.attachments.add(Attachment(type = ct, localPath = "${attachmentsDir.name}/$fileName"))
+                        message.attachments.add(Attachment(type = ct, localPath = "attachments/$fileName"))
                     }
                 }
             }
@@ -279,95 +231,72 @@ class MessageExporter(private val contentResolver: ContentResolver) {
     private fun getExtensionFromMimeType(mimeType: String): String {
         val extension = android.webkit.MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType)
         if (extension != null) return extension
-
-        return when {
-            mimeType.startsWith("image/") -> mimeType.substringAfter("image/").substringBefore(";").replace("jpeg", "jpg")
-            mimeType.startsWith("video/") -> mimeType.substringAfter("video/").substringBefore(";")
-            mimeType.startsWith("audio/") -> mimeType.substringAfter("audio/").substringBefore(";")
-            mimeType.contains("vcard") -> "vcf"
-            mimeType.contains("pdf") -> "pdf"
-            mimeType.contains("xml") -> "xml"
-            else -> "bin"
-        }
+        return mimeType.substringAfter("/").substringBefore(";").lowercase()
     }
 
     private fun savePartToFile(partId: Long, destFile: File): Boolean {
-        val partUri = "content://mms/part/$partId".toUri()
         return try {
-            contentResolver.openInputStream(partUri)?.use { input ->
-                FileOutputStream(destFile).use { output ->
-                    input.copyTo(output)
-                }
+            contentResolver.openInputStream("content://mms/part/$partId".toUri())?.use { input ->
+                FileOutputStream(destFile).use { output -> input.copyTo(output) }
             }
             true
-        } catch (e: Exception) {
-            Log.e("MessageExporter", "Failed to save MMS part $partId", e)
-            false
-        }
+        } catch (_: Exception) { false }
     }
 
-    private fun fetchSmsFromTable(threadId: Long, messages: MutableList<Message>) {
-        val smsUri = Telephony.Sms.CONTENT_URI
-        contentResolver.query(smsUri, arrayOf(Telephony.Sms._ID), "${Telephony.Sms.THREAD_ID} = ?", arrayOf(threadId.toString()), "date ASC")?.use { c ->
-            val idCol = c.getColumnIndex(Telephony.Sms._ID)
-            while (c.moveToNext()) {
-                fetchSmsMessage(c.getLong(idCol), messages)
+    private fun copyXsdFromAssets(destFile: File) {
+        try {
+            context.assets.open("messages.xsd").use { input ->
+                FileOutputStream(destFile).use { output -> input.copyTo(output) }
             }
-        }
+        } catch (_: Exception) {}
     }
 
-    private fun fetchMmsFromTable(threadId: Long, messages: MutableList<Message>, attachmentsDir: File) {
-        val mmsUri = Telephony.Mms.CONTENT_URI
-        contentResolver.query(mmsUri, arrayOf(Telephony.Mms._ID), "${Telephony.Mms.THREAD_ID} = ?", arrayOf(threadId.toString()), "date ASC")?.use { c ->
-            val idCol = c.getColumnIndex(Telephony.Mms._ID)
-            while (c.moveToNext()) {
-                fetchMmsMessage(c.getLong(idCol), messages, attachmentsDir)
+    private fun getThreadAddresses(threadId: Long): List<String> {
+        val result = mutableListOf<String>()
+        val uri = "content://mms-sms/conversations?simple=true".toUri()
+        contentResolver.query(uri, arrayOf("recipient_ids"), "_id = ?", arrayOf(threadId.toString()), null)?.use { c ->
+            if (c.moveToFirst()) {
+                val ids = c.getString(0)?.split(" ") ?: emptyList()
+                val addressUri = "content://mms-sms/canonical-addresses".toUri()
+                ids.forEach { id ->
+                    if (id.isBlank()) return@forEach
+                    try {
+                        contentResolver.query(addressUri, arrayOf("address"), "_id = ?", arrayOf(id), null)?.use { ac ->
+                            if (ac.moveToFirst()) ac.getString(0)?.let { result.add(it) }
+                        }
+                    } catch (_: Exception) {}
+                }
             }
         }
+        return result
     }
 
     private fun escapeXml(text: String): String {
-        return text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\"", "&quot;")
-            .replace("'", "&#39;")
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")
     }
 
     private fun getContactName(phoneNumber: String): String {
         if (phoneNumber.isBlank() || phoneNumber == "Unknown") return phoneNumber
         contactCache[phoneNumber]?.let { return it }
-
-        val uri = Uri.withAppendedPath(
-            android.provider.ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
-            Uri.encode(phoneNumber)
-        )
-        val projection = arrayOf(android.provider.ContactsContract.PhoneLookup.DISPLAY_NAME)
-        
+        val uri = Uri.withAppendedPath(android.provider.ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(phoneNumber))
         try {
-            contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+            contentResolver.query(uri, arrayOf(android.provider.ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null)?.use { cursor ->
                 if (cursor.moveToFirst()) {
                     val name = cursor.getString(0)
                     contactCache[phoneNumber] = name
                     return name
                 }
             }
-        } catch (_: Exception) {
-        }
+        } catch (_: Exception) {}
         return phoneNumber
     }
 
-    private var reactionProviderStatus: Int = 0 // 0: Unknown, 1: Exists, 2: Missing
+    private var reactionProviderStatus: Int = 0 
 
     private fun getReactions(messageId: Long): List<String> {
         if (reactionProviderStatus == 2) return emptyList()
-
         val reactions = mutableListOf<String>()
-        val uris = arrayOf(
-            "content://telephony/message_reactions".toUri(),
-            "content://message_reactions".toUri(),
-        )
-
+        val uris = arrayOf("content://telephony/message_reactions".toUri(), "content://message_reactions".toUri())
         for (uri in uris) {
             try {
                 contentResolver.query(uri, null, "message_id = ?", arrayOf(messageId.toString()), null)?.use { cursor ->
@@ -380,13 +309,9 @@ class MessageExporter(private val contentResolver: ContentResolver) {
                 }
                 if (reactions.isNotEmpty() || reactionProviderStatus == 1) break
             } catch (e: Exception) {
-                if (e is SecurityException || e.message?.contains("find provider") == true) {
-                    reactionProviderStatus = 2
-                }
+                if (e is SecurityException || e.message?.contains("find provider") == true) reactionProviderStatus = 2
             }
         }
-        
-        if (reactionProviderStatus == 0) reactionProviderStatus = 2
         return reactions
     }
 
@@ -416,8 +341,5 @@ class MessageExporter(private val contentResolver: ContentResolver) {
         val attachments: MutableList<Attachment> = mutableListOf()
     )
 
-    data class Attachment(
-        val type: String,
-        val localPath: String
-    )
+    data class Attachment(val type: String, val localPath: String)
 }

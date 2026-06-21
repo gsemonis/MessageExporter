@@ -15,6 +15,10 @@ import java.util.zip.ZipOutputStream
 
 class ExportService : Service() {
 
+    companion object {
+        var isExporting = false
+    }
+
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val notificationId = 1001
     private val channelId = "export_channel"
@@ -26,6 +30,7 @@ class ExportService : Service() {
         val contactName = intent?.getStringExtra("contactName") ?: "Unknown"
 
         if (threadId != -1L) {
+            isExporting = true
             startForegroundService(contactName)
             serviceScope.launch {
                 performExport(threadId, contactName)
@@ -40,6 +45,7 @@ class ExportService : Service() {
     private fun startForegroundService(contactName: String) {
         createNotificationChannel()
         val notification = createNotification("Exporting messages for $contactName...", isDone = false)
+        
         startForeground(notificationId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
     }
 
@@ -47,7 +53,7 @@ class ExportService : Service() {
         val serviceChannel = NotificationChannel(
             channelId,
             "Message Export Service",
-            NotificationManager.IMPORTANCE_LOW
+            NotificationManager.IMPORTANCE_LOW,
         )
         val manager = getSystemService(NotificationManager::class.java)
         manager?.createNotificationChannel(serviceChannel)
@@ -77,13 +83,15 @@ class ExportService : Service() {
                 val safeName = contactName.replace(Regex("[^a-zA-Z0-9]"), "_").take(20)
                 val baseFileName = "export_${safeName}_$threadId"
                 val xmlFile = File(dir, "$baseFileName.xml")
+                val xsdFile = File(dir, "messages.xsd")
                 val attachmentsDir = File(dir, "attachments_$baseFileName")
                 val zipFile = File(dir, "$baseFileName.zip")
 
-                val exporter = MessageExporter(contentResolver)
+                val exporter = MessageExporter(this@ExportService)
                 val success = exporter.exportThread(threadId, xmlFile) { current, total ->
-                    updateNotification("Exporting $current of $total messages...")
+                    updateNotificationProgress("Exporting $current of $total messages...")
                     val intent = Intent("com.sway.messageexporter.EXPORT_PROGRESS").apply {
+                        setPackage(packageName)
                         putExtra("current", current)
                         putExtra("total", total)
                     }
@@ -91,18 +99,20 @@ class ExportService : Service() {
                 }
 
                 if (success) {
-                    createZipArchive(zipFile, xmlFile, attachmentsDir)
+                    updateNotificationProgress("Zipping files... please wait.")
+                    createZipArchive(zipFile, xmlFile, xsdFile, attachmentsDir)
                     showDoneNotification("Export complete for $contactName!")
-                    sendBroadcast(Intent("com.sway.messageexporter.EXPORT_COMPLETE"))
+                    sendBroadcast(Intent("com.sway.messageexporter.EXPORT_COMPLETE").apply { setPackage(packageName) })
                 } else {
                     showDoneNotification("Export failed for $contactName")
-                    sendBroadcast(Intent("com.sway.messageexporter.EXPORT_FAILED"))
+                    sendBroadcast(Intent("com.sway.messageexporter.EXPORT_FAILED").apply { setPackage(packageName) })
                 }
             } catch (e: Exception) {
                 Log.e("ExportService", "Export failed", e)
                 showDoneNotification("Error exporting $contactName: ${e.message}")
-                sendBroadcast(Intent("com.sway.messageexporter.EXPORT_FAILED"))
+                sendBroadcast(Intent("com.sway.messageexporter.EXPORT_FAILED").apply { setPackage(packageName) })
             } finally {
+                isExporting = false
                 stopForeground(STOP_FOREGROUND_DETACH)
                 stopSelf()
             }
@@ -114,15 +124,18 @@ class ExportService : Service() {
         manager?.notify(notificationId + 1, createNotification(text, isDone = true))
     }
 
-    private fun updateNotification(text: String) {
+    private fun updateNotificationProgress(text: String) {
         val manager = getSystemService(NotificationManager::class.java)
         manager?.notify(notificationId, createNotification(text, isDone = false))
     }
 
-    private fun createZipArchive(zipFile: File, xmlFile: File, attachmentsDir: File) {
+    private fun createZipArchive(zipFile: File, xmlFile: File, xsdFile: File, attachmentsDir: File) {
         ZipOutputStream(FileOutputStream(zipFile)).use { out ->
             if (xmlFile.exists()) {
                 addToZip(out, xmlFile, "")
+            }
+            if (xsdFile.exists()) {
+                addToZip(out, xsdFile, "")
             }
             if (attachmentsDir.exists()) {
                 attachmentsDir.listFiles()?.forEach { file ->
@@ -131,6 +144,7 @@ class ExportService : Service() {
             }
         }
         xmlFile.delete()
+        xsdFile.delete()
         attachmentsDir.deleteRecursively()
     }
 

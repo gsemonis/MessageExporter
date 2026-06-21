@@ -25,7 +25,9 @@ class SmsReceiver : BroadcastReceiver() {
     private val channelId = "incoming_messages"
 
     override fun onReceive(context: Context?, intent: Intent?) {
-        if (context == null || intent == null || intent.action != Telephony.Sms.Intents.SMS_DELIVER_ACTION) return
+        if (context == null || intent == null) return
+        val action = intent.action
+        if (action != Telephony.Sms.Intents.SMS_DELIVER_ACTION) return
 
         val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
         for (sms in messages) {
@@ -70,9 +72,7 @@ class SmsReceiver : BroadcastReceiver() {
 
 class MmsReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
-        // MMS handling is significantly more complex (requires PDU parsing), 
-        // but modern Android usually handles the database commit for MMS 
-        // automatically if the app doesn't consume the broadcast.
+        // MMS handling is significantly more complex
     }
 }
 

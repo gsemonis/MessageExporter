@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="thread">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="participants">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="participant" maxOccurs="unbounded" minOccurs="0">
+                <xs:complexType>
+                  <xs:attribute name="name" type="xs:string" use="required"/>
+                  <xs:attribute name="address" type="xs:string" use="required"/>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="message" maxOccurs="unbounded" minOccurs="0">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="sender">
+                <xs:complexType>
+                  <xs:attribute name="name" type="xs:string"/>
+                  <xs:attribute name="address" type="xs:string" use="required"/>
+                </xs:complexType>
+              </xs:element>
+              <xs:element name="body" type="xs:string"/>
+              <xs:element name="attachments" minOccurs="0">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="attachment" maxOccurs="unbounded">
+                      <xs:complexType>
+                        <xs:attribute name="type" type="xs:string" use="required"/>
+                        <xs:attribute name="file" type="xs:string" use="required"/>
+                      </xs:complexType>
+                    </xs:element>
+                  </xs:sequence>
+                </xs:complexType>
+              </xs:element>
+              <xs:element name="reactions" minOccurs="0">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="reaction" type="xs:string" maxOccurs="unbounded"/>
+                  </xs:sequence>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+            <xs:attribute name="id" type="xs:long" use="required"/>
+            <xs:attribute name="type" type="xs:string" use="required"/>
+            <xs:attribute name="protocol" type="xs:string" use="required"/>
+            <xs:attribute name="timestamp" type="xs:long" use="required"/>
+            <xs:attribute name="date" type="xs:dateTime" use="required"/>
+            <xs:attribute name="rcs_id" type="xs:string"/>
+            <xs:attribute name="reply_to" type="xs:string"/>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+      <xs:attribute name="id" type="xs:long" use="required"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>

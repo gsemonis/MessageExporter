@@ -79,7 +79,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
-        private const val REQUEST_CODE_PERMISSIONS = 123
+        private const val requestCodePermissions = 123
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -118,10 +118,23 @@ class MainActivity : AppCompatActivity() {
         
         setContentView(root)
 
+        handleIntent(intent)
+
         if (checkPermissions()) {
             loadThreads()
         } else {
             requestPermissions()
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra("show_switch_prompt", false) == true) {
+            showSwitchBackPrompt()
         }
     }
 
@@ -211,12 +224,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun requestPermissions() {
         val permissions = arrayOf(Manifest.permission.READ_SMS, Manifest.permission.READ_CONTACTS, Manifest.permission.POST_NOTIFICATIONS)
-        ActivityCompat.requestPermissions(this, permissions, REQUEST_CODE_PERMISSIONS)
+        ActivityCompat.requestPermissions(this, permissions, requestCodePermissions)
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+        if (requestCode == requestCodePermissions) {
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 loadThreads()
             } else {
